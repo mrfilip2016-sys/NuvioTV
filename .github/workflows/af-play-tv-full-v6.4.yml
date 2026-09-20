@@ -1,0 +1,237 @@
+name: AF Play TV - Stable Live TV v6.4
+
+on:
+  workflow_dispatch:
+    inputs:
+      playlist_url:
+        description: "URL JSON/M3U TV implicit"
+        required: false
+        default: "https://acasatv.co/zxy.json"
+  push:
+    branches: [dev]
+    paths:
+      - '.github/workflows/af-play-tv-full-v6.4.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: af-play-tv-v64-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build AF Play TV v6.4 ARM APKs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      PLAYLIST_URL: ${{ github.event.inputs.playlist_url || 'https://acasatv.co/zxy.json' }}
+
+    steps:
+      - name: Checkout NuvioTV
+        uses: actions/checkout@v6
+        with:
+          ref: dev
+          fetch-depth: 1
+          submodules: false
+
+      - name: Validate checkout and v6.2 base
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f app/build.gradle.kts
+          test -f app/src/main/java/com/nuvio/tv/MainActivity.kt
+          test -f app/src/main/java/com/nuvio/tv/NuvioApplication.kt
+          test -f .github/workflows/af-play-tv-full-v6.2.yml
+          chmod +x gradlew
+          echo "NuvioTV dev + v6.2 base workflow OK"
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Prepare local properties
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > local.properties <<'EOF'
+          TRAKT_REDIRECT_URI=urn:ietf:wg:oauth:2.0:oob
+          SIMKL_APP_NAME=afplay
+          USE_LOCAL_FFMPEG_DECODER=false
+          DOVI_NATIVE_ENABLED=false
+          DOVI_EXTRACTOR_HOOK_READY=false
+          DOVI_ENABLE_REAL_LINK=false
+          SUPPORTERS_API_BASE_URL=https://nuvio.tv/
+          SUPPORT_URL=https://nuvio.tv/support
+          EOF
+          touch local.dev.properties
+
+      - name: Prepare CI signing
+        shell: bash
+        run: |
+          set -euo pipefail
+          keytool -genkeypair \
+            -v \
+            -keystore "$RUNNER_TEMP/afplay-tv.jks" \
+            -storepass android \
+            -alias afplaytv \
+            -keypass android \
+            -dname "CN=AF Play TV,O=AF Studio,C=IT" \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000
+          {
+            echo "NUVIO_RELEASE_STORE_FILE=$RUNNER_TEMP/afplay-tv.jks"
+            echo "NUVIO_RELEASE_KEY_ALIAS=afplaytv"
+            echo "NUVIO_RELEASE_KEY_PASSWORD=android"
+            echo "NUVIO_RELEASE_STORE_PASSWORD=android"
+          } >> "$GITHUB_ENV"
+
+      - name: Apply known-good AF Play v6.2 base patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import base64
+          import os
+          import re
+
+          workflow_path = Path(".github/workflows/af-play-tv-full-v6.2.yml")
+          text = workflow_path.read_text(encoding="utf-8")
+
+          match = re.search(
+              r"""cat > "\$RUNNER_TEMP/afplay_tv_patch\.b64" <<'AFPLAY_PATCH'\n(.*?)\n\s*AFPLAY_PATCH""",
+              text,
+              flags=re.S,
+          )
+          if not match:
+              raise SystemExit("Nu am găsit patch-ul base64 din v6.2")
+
+          encoded = "".join(line.strip() for line in match.group(1).splitlines())
+          decoded = base64.b64decode(encoded, validate=True)
+
+          patch_path = Path(os.environ["RUNNER_TEMP"]) / "afplay_v62_patch.py"
+          patch_path.write_bytes(decoded)
+          compile(decoded.decode("utf-8"), str(patch_path), "exec")
+          print(f"v6.2 patch extracted OK: {len(decoded)} bytes")
+          PY
+
+          python3 "$RUNNER_TEMP/afplay_v62_patch.py"
+
+      - name: Harden Live TV and mark v6.4
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          tv_path = Path("app/src/main/java/com/nuvio/tv/ui/screens/livetv/LiveTvScreen.kt")
+          text = tv_path.read_text(encoding="utf-8")
+
+          # v6.2 is the stable TV implementation:
+          # - grouping only from playlist category/group
+          # - Generale & Știri first, Sport second
+          # - full-card artwork with ContentScale.Crop
+          # Keep that behavior and only make item keys collision-proof.
+          import_anchor = "import androidx.compose.foundation.lazy.items\n"
+          if "import androidx.compose.foundation.lazy.itemsIndexed" not in text:
+              if import_anchor not in text:
+                  raise SystemExit("Live TV items import anchor missing")
+              text = text.replace(
+                  import_anchor,
+                  import_anchor + "import androidx.compose.foundation.lazy.itemsIndexed\n",
+                  1,
+              )
+
+          old_items = 'items(groupChannels, key = { it.id + it.name }) { channel ->'
+          new_items = (
+              'itemsIndexed(\n'
+              '                                items = groupChannels,\n'
+              '                                key = { index, channel -> "$group|$index|${channel.id}|${channel.name}" },\n'
+              '                            ) { _, channel ->'
+          )
+          if old_items not in text:
+              raise SystemExit("Live TV card items anchor missing")
+          text = text.replace(old_items, new_items, 1)
+
+          # Guard against accidentally reintroducing v6.3 Smart TV categorization.
+          forbidden = [
+              "channelPriority(",
+              "displayCategory(channel)",
+              '"Documentare & Știință" -> 2',
+              '"Filme & Seriale" -> 3',
+          ]
+          found = [needle for needle in forbidden if needle in text]
+          if found:
+              raise SystemExit("v6.3 Smart TV logic still present: " + ", ".join(found))
+
+          tv_path.write_text(text, encoding="utf-8")
+
+          gradle_path = Path("app/build.gradle.kts")
+          gradle = gradle_path.read_text(encoding="utf-8")
+          updated, count = re.subn(
+              r'versionName\s*=\s*"[^"]+"',
+              'versionName = "6.4"',
+              gradle,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit("versionName anchor missing")
+          gradle_path.write_text(updated, encoding="utf-8")
+          PY
+
+      - name: Verify v6.4 TV regression fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          TV="app/src/main/java/com/nuvio/tv/ui/screens/livetv/LiveTvScreen.kt"
+
+          grep -F 'ContentScale.Crop' "$TV"
+          grep -F 'displayCategory(channel.group)' "$TV"
+          grep -F '"Generale & Știri" -> 0' "$TV"
+          grep -F '"Sport" -> 1' "$TV"
+          grep -F 'itemsIndexed(' "$TV"
+          grep -F 'key = { index, channel -> "$group|$index|${channel.id}|${channel.name}" }' "$TV"
+          grep -F 'versionName = "6.4"' app/build.gradle.kts
+
+          if grep -Fq 'channelPriority(' "$TV"; then
+            echo "ERROR: v6.3 channel smart-sorting still present"
+            exit 1
+          fi
+          if grep -Fq 'displayCategory(channel)' "$TV"; then
+            echo "ERROR: v6.3 name-based smart categorization still present"
+            exit 1
+          fi
+
+          echo "AF Play v6.4 TV regression fix verified"
+
+      - name: Build full debug ARM APKs
+        env:
+          CI_USE_DEBUG_SIGNING: 'false'
+        run: ./gradlew :app:assembleFullDebug --stacktrace --no-daemon --console=plain
+
+      - name: Collect APKs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          ARM64="$(find app/build/outputs/apk/full/debug -maxdepth 1 -type f -name '*arm64-v8a*debug*.apk' | head -n 1)"
+          ARM32="$(find app/build/outputs/apk/full/debug -maxdepth 1 -type f -name '*armeabi-v7a*debug*.apk' | head -n 1)"
+          test -n "$ARM64"
+          test -n "$ARM32"
+          cp "$ARM64" out/AF-Play-TV-v6.4-arm64-v8a.apk
+          cp "$ARM32" out/AF-Play-TV-v6.4-armeabi-v7a.apk
+          ls -lh out/*.apk
+
+      - name: Upload AF Play TV v6.4 APKs
+        uses: actions/upload-artifact@v7
+        with:
+          name: AF-Play-TV-v6.4-AndroidTV-FireTV
+          path: out/*.apk
+          if-no-files-found: error
+          retention-days: 14
